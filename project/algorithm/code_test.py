@@ -28,42 +28,44 @@ warnings.filterwarnings('ignore')
 pd.set_option('display.max_columns', 1000)
 pd.set_option('display.max_row', 1000)
 
-
+# 读取训练集和测试集
 train_data = pd.read_csv("/home/zeriwang/2025Spring/DataMining/2025_Spring_UCAS_DataMining/project/data/train.csv")
 test_data = pd.read_csv("/home/zeriwang/2025Spring/DataMining/2025_Spring_UCAS_DataMining/project/data/evaluation_public.csv")
 
+# 添加标识并合并数据
 train_data['istest'] = 0
 test_data['istest'] = 1
-
 data = pd.concat([train_data, test_data]).reset_index(drop=True)
 
 data['id_by_me'] = pd.Series(range(len(data)))
 
+# 删除相同的特征
 del data['ip_type']
 
 # 特征工程
 
 #风险系数高的情况
-
+# 标记高风险地点
 data['is_forei/unknown'] = data['op_city'].apply(lambda x: 1 if x in['国外','未知'] else 0)
-
+# 标记HTTP状态码异常
 data['is_fail_code']=data['http_status_code'].apply(lambda x:0 if x==200 else 1)
-
 data['is_code_5']=data['http_status_code'].apply(lambda x:1 if x in [500,502] else 0)
-
+# 标记登录URL
 data['is_login_url'] = data['url'].apply(lambda x:1 if x in ['xxx.com/getVerifyCode','xxx.com/getLoginType'] else 0)
 
 
-
-
-
+# 转换时间格式
 data['op_datetime'] = pd.to_datetime(data['op_datetime'])
+# 提取日期部分
 data['day']=data['op_datetime'].astype(str).apply(lambda x:str(x)[5:10])
+# 提取小时
 data['hour'] = data['op_datetime'].dt.hour
+# 提取星期几(1-7)
 data['weekday'] = data['op_datetime'].dt.weekday+1
 
 data = data.sort_values(by=['user_name', 'op_datetime']).reset_index(drop=True)
 
+# 时间周期性特征（三角函数转换）
 data['hour_sin'] = np.sin(data['hour']/24*2*np.pi)
 data['hour_cos'] = np.cos(data['hour']/24*2*np.pi)
 
@@ -73,21 +75,23 @@ data['min'] = data['op_datetime'].apply(lambda x: int(str(x)[-5:-3]))
 data['min_sin'] = np.sin(data['min']/60*2*np.pi)
 data['min_cos'] = np.cos(data['min']/60*2*np.pi)
 
-#user上次点击时间差
+# 计算用户两次操作之间的时间差
 data['diff_last_1'] = data.groupby('user_name')['op_datetime'].transform(lambda i:i.diff(1)).dt.total_seconds()/60
 data['diff_last_2'] = data.groupby('user_name')['op_datetime'].transform(lambda i:i.diff(2)).dt.total_seconds()/60
 
 train_data = data[data['istest']==0]
 test = data[data['istest']==1]
 
-#train：
+# 计算用户下一次操作的时间差（仅在训练集）
 train_data['diff_next'] = -(train_data.groupby('user_name')['op_datetime'].transform(lambda i:i.diff(-1))).dt.total_seconds()/60
 data=pd.merge(data,train_data[['diff_next','id_by_me']],how='left', on='id_by_me')
 
+# 对多个特征计算时间差相关的统计量
 fea = ['user_name', 'department', 'ip_transform', 'device_num_transform', 'browser_version', 'browser',
           'os_type', 'os_version',  'op_city', 'log_system_transform', 'url']
 
 for col in fea:
+    # 计算每个特征分组下时间差的统计量
     data[col+'_diff1_mean'] = data.groupby(col)['diff_last_1'].transform('mean')
     data[col+'_diff1_std'] = data.groupby(col)['diff_last_1'].transform('std')
     data[col+'_diff1_max'] = data.groupby(col)['diff_last_1'].transform('max')
@@ -104,7 +108,6 @@ for col in fea:
 data=data.fillna(-999)
 
 
-
 def is_fail_code(x):
     if x==200:
         return 0
@@ -115,6 +118,7 @@ def is_fail_code(x):
 
 data['is_fail_usr']=data['user_name'].apply(lambda x:1 if x == "-999" else 0)#登陆失败
 
+# 周末标记
 def isweekend(x):
     if(x<6):
         return 0
@@ -123,6 +127,7 @@ def isweekend(x):
 
 data['isweekend']=data['weekday'].apply(isweekend)
 
+# 夜间标记(晚8点到早7点)
 def isnight(x):
     if (x>7)and(x<20):
         return 0
@@ -151,6 +156,7 @@ def if_adjust(x):
         return 0
 data['is_adjust'] = data['day'].apply(if_adjust)
 
+# 非工作日标记(周末且非调休，或节假日)
 data['is_not_work'] = data['isweekend'].astype(bool)&(~data['is_adjust'])|(data['isholiday'].astype(bool))
 
 
@@ -252,6 +258,7 @@ def get_nunique_minute(diff_list,uni_list,minute):
             break
     return pd.Series(ls).nunique()
 
+# 计算用户在不同时间窗口内使用的不同IP数量
 tmp['ip_time_nui_6'] = tmp.apply(lambda row:get_nunique_minute(row['ip_diff_list_30'],row['usr_ip_list_30'],60*6),axis=1)
 
 tmp['ip_time_nui_12'] = tmp.apply(lambda row:get_nunique_minute(row['ip_diff_list_30'],row['usr_ip_list_30'],60*12),axis=1)
@@ -353,7 +360,7 @@ for col in date_fea:
 numeric_features = data.select_dtypes(include=[np.number])
 categorical_features = data.select_dtypes(include=[object])
 
-
+# 对分类特征进行序数编码
 data[categorical_features.columns] = ce.OrdinalEncoder().fit_transform(data[categorical_features.columns])
 
 
@@ -361,12 +368,13 @@ data[categorical_features.columns] = ce.OrdinalEncoder().fit_transform(data[cate
 
 
 
-
+# 分离训练和测试数据
 train_data = data[data['istest']==0]
 test = data[data['istest']==1]
 
 test = test.sort_values('id').reset_index(drop=True)
 
+# 按时间分割训练集和验证集
 train = train_data[train_data['op_datetime']<'2022-04-01'].reset_index(drop=True)
 val = train_data[train_data['op_datetime']>='2022-04-01'].reset_index(drop=True)
 
@@ -389,8 +397,9 @@ var_pre = pd.DataFrame()
 
 lgb_score_list = []
 
-seeds=2022
+seeds=2025
 
+# LightGBM参数设置
 params_lgb  = {
     'learning_rate': 0.05,
     'boosting_type': 'gbdt',
@@ -398,7 +407,7 @@ params_lgb  = {
     'metric': 'auc',
     'num_leaves': 64,
     'verbose': -1,
-    'seed': 2022,
+    'seed': 2025,
     'n_jobs': -1,
 
     'feature_fraction': 0.8,
@@ -409,24 +418,29 @@ params_lgb  = {
 }
 
 
-#kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=2022)
-kf = KFold(n_splits=5, shuffle=True, random_state=2022)
+#kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=2025)
+kf = KFold(n_splits=5, shuffle=True, random_state=2025)
 for i, (train_idx, val_idx) in enumerate(kf.split(x_train, y_train)):
     print('************************************ {} {}************************************'.format(str(i+1), str(seeds)))
+    # 准备训练数据
     trn_x, trn_y, val_x, val_y = x_train.iloc[train_idx],y_train.iloc[train_idx], x_train.iloc[val_idx], y_train.iloc[val_idx]
     train_data = lgb.Dataset(trn_x,
                         trn_y)
     val_data = lgb.Dataset(val_x,
                         val_y)
+    
+    # 训练模型
     model = lgb.train(params_lgb, train_data, valid_sets=[val_data], num_boost_round=20000,
                       callbacks=[lgb.early_stopping(100), lgb.log_evaluation(2000)])
 
+    # 预测并记录结果
     pred_y['fold_%d_seed_%d' % (i, seeds)] = model.predict(x_test)
     var_pre['fold_%d_seed_%d' % (i, seeds)] = model.predict(x_val)
     
     importance += model.feature_importance(importance_type='gain') / 5
     lgb_score_list.append(auc(val_y, model.predict(val_x)))
 
+# 计算最终预测结果（多折平均）
 test['is_risk'] = pred_y.mean(axis=1).values
 
 df_test = pd.read_csv('/home/zeriwang/2025Spring/DataMining/2025_Spring_UCAS_DataMining/project/data/evaluation_public.csv')
@@ -434,7 +448,10 @@ df_test = pd.merge(df_test,test[['id','is_risk']],how='left')
 df_test['op_datetime'] = pd.to_datetime(df_test['op_datetime'])
 df_test = df_test.sort_values('op_datetime').reset_index(drop=True)
 df_test['hour'] = df_test['op_datetime'].dt.hour
+
+# 根据时间进行后处理调整（深夜和凌晨操作视为高风险）
 df_test.loc[df_test['hour']<6,'is_risk'] = 1
 df_test.loc[df_test['hour']>20,'is_risk'] = 1
 
+# 保存结果
 df_test[['id','is_risk']].to_csv("/home/zeriwang/2025Spring/DataMining/2025_Spring_UCAS_DataMining/project/data/result.csv", index=False)
