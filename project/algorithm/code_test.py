@@ -6,6 +6,9 @@ import gc
 from tqdm import *
 # 核心模型使用第三方库
 import lightgbm as lgb
+# 新增TabNet模型依赖
+from pytorch_tabnet.tab_model import TabNetClassifier
+import torch
 # 交叉验证所使用的第三方库
 from sklearn.model_selection import StratifiedKFold, KFold
 # 评估指标所使用的的第三方库
@@ -389,8 +392,7 @@ y_val = val['is_risk']
 x_test = test[fea]
 y_test = test['is_risk']
 
-
-
+# LightGBM模型部分
 importance = 0
 pred_y = pd.DataFrame()
 var_pre = pd.DataFrame()
@@ -417,17 +419,20 @@ params_lgb  = {
     "min_data_in_leaf":20
 }
 
+# TabNet模型预测结果保存
+tabnet_pred_y = pd.DataFrame()
+tabnet_var_pre = pd.DataFrame()
+tabnet_score_list = []
 
-#kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=2025)
 kf = KFold(n_splits=5, shuffle=True, random_state=2025)
 for i, (train_idx, val_idx) in enumerate(kf.split(x_train, y_train)):
     print('************************************ {} {}************************************'.format(str(i+1), str(seeds)))
     # 准备训练数据
     trn_x, trn_y, val_x, val_y = x_train.iloc[train_idx],y_train.iloc[train_idx], x_train.iloc[val_idx], y_train.iloc[val_idx]
-    train_data = lgb.Dataset(trn_x,
-                        trn_y)
-    val_data = lgb.Dataset(val_x,
-                        val_y)
+    
+    # ====== LightGBM模型训练 ======
+    train_data = lgb.Dataset(trn_x, trn_y)
+    val_data = lgb.Dataset(val_x, val_y)
     
     # 训练模型
     model = lgb.train(params_lgb, train_data, valid_sets=[val_data], num_boost_round=20000,
@@ -439,9 +444,115 @@ for i, (train_idx, val_idx) in enumerate(kf.split(x_train, y_train)):
     
     importance += model.feature_importance(importance_type='gain') / 5
     lgb_score_list.append(auc(val_y, model.predict(val_x)))
+    
+    # ====== TabNet模型训练 ======
+    print("Training TabNet model for fold {}".format(i+1))
+    
+    # 转换为NumPy数组前确保没有NaN值
+    trn_x_tabnet = trn_x.fillna(-999)
+    val_x_tabnet = val_x.fillna(-999)
+    x_test_tabnet = x_test.fillna(-999)
+    
+    # 检查是否还有NaN值
+    if trn_x_tabnet.isna().any().any():
+        print("警告：训练数据中仍存在NaN值，将进一步处理")
+        trn_x_tabnet = trn_x_tabnet.fillna(0)
+    
+    if val_x_tabnet.isna().any().any():
+        print("警告：验证数据中仍存在NaN值，将进一步处理")
+        val_x_tabnet = val_x_tabnet.fillna(0)
+    
+    if x_test_tabnet.isna().any().any():
+        print("警告：测试数据中仍存在NaN值，将进一步处理")
+        x_test_tabnet = x_test_tabnet.fillna(0)
+    
+    # 检查并移除非数值型列（object类型）
+    object_cols = trn_x_tabnet.select_dtypes(include=['object']).columns.tolist()
+    if object_cols:
+        print(f"警告：发现对象类型列 {object_cols}，这些将从TabNet输入中移除")
+        trn_x_tabnet = trn_x_tabnet.select_dtypes(exclude=['object'])
+        val_x_tabnet = val_x_tabnet.select_dtypes(exclude=['object'])
+        x_test_tabnet = x_test_tabnet.select_dtypes(exclude=['object'])
+    
+    # 记录保留的特征名称，确保预测时使用相同的特征集
+    tabnet_feature_names = trn_x_tabnet.columns.tolist()
+    
+    # 转换为NumPy数组
+    X_train_np = trn_x_tabnet.values
+    y_train_np = trn_y.values
+    X_val_np = val_x_tabnet.values
+    y_val_np = val_y.values
+    
+    # TabNet模型参数
+    tabnet_params = {
+        "n_d": 64,
+        "n_a": 64,
+        "n_steps": 5,
+        "gamma": 1.5,
+        "n_independent": 2,
+        "n_shared": 2,
+        "cat_idxs": [],
+        "cat_dims": [],
+        "cat_emb_dim": 1,
+        "lambda_sparse": 1e-4,
+        "optimizer_fn": torch.optim.Adam,
+        "optimizer_params": dict(lr=2e-2),
+        "mask_type": "entmax",
+        "scheduler_params": dict(mode="min", patience=5, min_lr=1e-5, factor=0.9),
+        "scheduler_fn": torch.optim.lr_scheduler.ReduceLROnPlateau,
+        "seed": 2025,
+        "verbose": 1
+    }
+    
+    # 添加禁用特征重要性计算的参数
+    clf = TabNetClassifier(**tabnet_params)
+    
+    # 训练TabNet模型
+    clf.fit(
+        X_train=X_train_np, y_train=y_train_np,
+        eval_set=[(X_val_np, y_val_np)],
+        max_epochs=200,
+        patience=20,
+        batch_size=1024,
+        virtual_batch_size=128,
+        num_workers=0,
+        drop_last=False,
+        compute_importance=False  # 禁用特征重要性计算，避免explain方法被调用
+    )
+    
+    # TabNet预测，确保使用相同的预处理数据和特征
+    # 明确使用与训练相同的特征子集
+    tabnet_test_preds = clf.predict_proba(x_test_tabnet[tabnet_feature_names].values)[:, 1]
+    tabnet_val_preds = clf.predict_proba(val_x_tabnet[tabnet_feature_names].values)[:, 1]
+    
+    # 保存TabNet预测结果
+    tabnet_pred_y['fold_%d_seed_%d' % (i, seeds)] = tabnet_test_preds
+    tabnet_var_pre['fold_%d_seed_%d' % (i, seeds)] = tabnet_val_preds
+    
+    # 计算TabNet在验证集上的性能 - 使用相同的特征子集
+    tabnet_score = auc(val_y, clf.predict_proba(val_x_tabnet[tabnet_feature_names].values)[:, 1])
+    tabnet_score_list.append(tabnet_score)
+    print(f"TabNet Fold {i+1} AUC: {tabnet_score}")
 
-# 计算最终预测结果（多折平均）
-test['is_risk'] = pred_y.mean(axis=1).values
+# 计算两个模型的平均分数
+lgb_avg_score = np.mean(lgb_score_list)
+tabnet_avg_score = np.mean(tabnet_score_list)
+print(f"LightGBM平均AUC: {lgb_avg_score}")
+print(f"TabNet平均AUC: {tabnet_avg_score}")
+
+# 根据验证集性能确定模型权重
+# 使用验证集上的性能作为权重的基础
+lgb_weight = lgb_avg_score / (lgb_avg_score + tabnet_avg_score)
+tabnet_weight = tabnet_avg_score / (lgb_avg_score + tabnet_avg_score)
+
+print(f"LightGBM权重: {lgb_weight}, TabNet权重: {tabnet_weight}")
+
+# 模型融合 - 线性加权方法
+lgb_preds = pred_y.mean(axis=1).values
+tabnet_preds = tabnet_pred_y.mean(axis=1).values
+
+# 融合预测结果
+test['is_risk'] = lgb_weight * lgb_preds + tabnet_weight * tabnet_preds
 
 df_test = pd.read_csv('/home/zeriwang/2025Spring/DataMining/2025_Spring_UCAS_DataMining/project/data/evaluation_public.csv')
 df_test = pd.merge(df_test,test[['id','is_risk']],how='left')
@@ -455,3 +566,9 @@ df_test.loc[df_test['hour']>20,'is_risk'] = 1
 
 # 保存结果
 df_test[['id','is_risk']].to_csv("/home/zeriwang/2025Spring/DataMining/2025_Spring_UCAS_DataMining/project/data/result.csv", index=False)
+
+# 保存单模型结果，便于后续分析
+test['lgb_risk'] = lgb_preds
+test['tabnet_risk'] = tabnet_preds
+test[['id', 'lgb_risk', 'tabnet_risk', 'is_risk']].to_csv(
+    "/home/zeriwang/2025Spring/DataMining/2025_Spring_UCAS_DataMining/project/data/model_fusion_detail.csv", index=False)
