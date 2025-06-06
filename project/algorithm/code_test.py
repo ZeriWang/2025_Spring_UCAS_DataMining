@@ -424,6 +424,10 @@ tabnet_pred_y = pd.DataFrame()
 tabnet_var_pre = pd.DataFrame()
 tabnet_score_list = []
 
+# 预先初始化DataFrame索引，确保长度一致
+tabnet_pred_y = pd.DataFrame(index=range(len(x_test)))
+tabnet_var_pre = pd.DataFrame(index=range(len(x_train)))  # 修改为x_train的长度
+
 kf = KFold(n_splits=5, shuffle=True, random_state=2025)
 for i, (train_idx, val_idx) in enumerate(kf.split(x_train, y_train)):
     print('************************************ {} {}************************************'.format(str(i+1), str(seeds)))
@@ -448,10 +452,13 @@ for i, (train_idx, val_idx) in enumerate(kf.split(x_train, y_train)):
     # ====== TabNet模型训练 ======
     print("Training TabNet model for fold {}".format(i+1))
     
+    # 保存原始索引以确保预测结果能正确对应
+    original_val_idx = val_x.index
+    
     # 转换为NumPy数组前确保没有NaN值
-    trn_x_tabnet = trn_x.fillna(-999)
-    val_x_tabnet = val_x.fillna(-999)
-    x_test_tabnet = x_test.fillna(-999)
+    trn_x_tabnet = trn_x.fillna(-999).copy()
+    val_x_tabnet = val_x.fillna(-999).copy()
+    x_test_tabnet = x_test.fillna(-999).copy()
     
     # 检查是否还有NaN值
     if trn_x_tabnet.isna().any().any():
@@ -474,14 +481,31 @@ for i, (train_idx, val_idx) in enumerate(kf.split(x_train, y_train)):
         val_x_tabnet = val_x_tabnet.select_dtypes(exclude=['object'])
         x_test_tabnet = x_test_tabnet.select_dtypes(exclude=['object'])
     
+    # 强制转换所有列为数值型
+    for col in trn_x_tabnet.columns:
+        trn_x_tabnet[col] = pd.to_numeric(trn_x_tabnet[col], errors='coerce').fillna(0)
+        val_x_tabnet[col] = pd.to_numeric(val_x_tabnet[col], errors='coerce').fillna(0)
+        x_test_tabnet[col] = pd.to_numeric(x_test_tabnet[col], errors='coerce').fillna(0)
+    
+    # 确保数据类型为float64
+    trn_x_tabnet = trn_x_tabnet.astype(np.float64)
+    val_x_tabnet = val_x_tabnet.astype(np.float64)
+    x_test_tabnet = x_test_tabnet.astype(np.float64)
+    
     # 记录保留的特征名称，确保预测时使用相同的特征集
     tabnet_feature_names = trn_x_tabnet.columns.tolist()
     
+    # 验证数据类型和形状
+    print(f"TabNet特征数量: {len(tabnet_feature_names)}")
+    print(f"训练数据形状: {trn_x_tabnet.shape}, 数据类型: {trn_x_tabnet.dtypes.unique()}")
+    print(f"验证数据形状: {val_x_tabnet.shape}")
+    print(f"测试数据形状: {x_test_tabnet.shape}")
+    
     # 转换为NumPy数组
-    X_train_np = trn_x_tabnet.values
-    y_train_np = trn_y.values
-    X_val_np = val_x_tabnet.values
-    y_val_np = val_y.values
+    X_train_np = trn_x_tabnet.values.astype(np.float32)
+    y_train_np = trn_y.values.astype(np.int64)
+    X_val_np = val_x_tabnet.values.astype(np.float32)
+    y_val_np = val_y.values.astype(np.int64)
     
     # TabNet模型参数
     tabnet_params = {
@@ -522,15 +546,47 @@ for i, (train_idx, val_idx) in enumerate(kf.split(x_train, y_train)):
     
     # TabNet预测，确保使用相同的预处理数据和特征
     # 明确使用与训练相同的特征子集
-    tabnet_test_preds = clf.predict_proba(x_test_tabnet[tabnet_feature_names].values)[:, 1]
-    tabnet_val_preds = clf.predict_proba(val_x_tabnet[tabnet_feature_names].values)[:, 1]
+    test_data_for_pred = x_test_tabnet[tabnet_feature_names].values.astype(np.float32)
+    val_data_for_pred = val_x_tabnet[tabnet_feature_names].values.astype(np.float32)
+    
+    tabnet_test_preds = clf.predict_proba(test_data_for_pred)[:, 1]
+    tabnet_val_preds = clf.predict_proba(val_data_for_pred)[:, 1]
+    
+    # 验证预测结果长度
+    print(f"验证集原始长度: {len(val_y)}, TabNet预测长度: {len(tabnet_val_preds)}")
+    print(f"测试集原始长度: {len(x_test)}, TabNet预测长度: {len(tabnet_test_preds)}")
+    
+    # 确保长度匹配，如果不匹配则用均值填充或截断
+    if len(tabnet_val_preds) != len(val_y):
+        print(f"警告：验证集预测长度不匹配，调整长度从 {len(tabnet_val_preds)} 到 {len(val_y)}")
+        if len(tabnet_val_preds) < len(val_y):
+            # 如果预测结果较短，用均值填充
+            mean_pred = np.mean(tabnet_val_preds)
+            tabnet_val_preds = np.append(tabnet_val_preds, [mean_pred] * (len(val_y) - len(tabnet_val_preds)))
+        else:
+            # 如果预测结果较长，截断
+            tabnet_val_preds = tabnet_val_preds[:len(val_y)]
+    
+    if len(tabnet_test_preds) != len(x_test):
+        print(f"警告：测试集预测长度不匹配，调整长度从 {len(tabnet_test_preds)} 到 {len(x_test)}")
+        if len(tabnet_test_preds) < len(x_test):
+            # 如果预测结果较短，用均值填充
+            mean_pred = np.mean(tabnet_test_preds)
+            tabnet_test_preds = np.append(tabnet_test_preds, [mean_pred] * (len(x_test) - len(tabnet_test_preds)))
+        else:
+            # 如果预测结果较长，截断
+            tabnet_test_preds = tabnet_test_preds[:len(x_test)]
+    
+    # 创建与x_train长度一致的预测结果数组
+    fold_val_preds = np.full(len(x_train), np.nan)
+    fold_val_preds[val_idx] = tabnet_val_preds
     
     # 保存TabNet预测结果
     tabnet_pred_y['fold_%d_seed_%d' % (i, seeds)] = tabnet_test_preds
-    tabnet_var_pre['fold_%d_seed_%d' % (i, seeds)] = tabnet_val_preds
+    tabnet_var_pre['fold_%d_seed_%d' % (i, seeds)] = fold_val_preds
     
-    # 计算TabNet在验证集上的性能 - 使用相同的特征子集
-    tabnet_score = auc(val_y, clf.predict_proba(val_x_tabnet[tabnet_feature_names].values)[:, 1])
+    # 计算TabNet在验证集上的性能 - 使用调整后的预测结果
+    tabnet_score = auc(val_y, tabnet_val_preds)
     tabnet_score_list.append(tabnet_score)
     print(f"TabNet Fold {i+1} AUC: {tabnet_score}")
 
